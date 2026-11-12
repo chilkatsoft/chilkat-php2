@@ -1,0 +1,26 @@
+{
+    "name": "chilkat/chilkat2",
+    "description": "Chilkat2 PHP: installs the chilkat2 extension (namespace Chilkat2\\: Http, Crypt2, Email, MailMan, Imap, Ftp2, SFtp, Ssh, Rest, Zip, JsonObject, Xml, Pdf, Cert, Jwt, ...) matching your PHP with vendor/bin/chilkat2-install, and provides its IDE / static-analysis stub.",
+    "type": "library",
+    "license": "proprietary",
+    "homepage": "https://www.chilkatsoft.com/chilkat2-php.asp",
+    "keywords": ["chilkat", "chilkat2", "extension", "crypto", "encryption", "email", "smtp", "imap", "ftp", "sftp", "ssh", "http", "rest", "zip", "xml", "json", "pdf", "certificates", "jwt", "oauth2"],
+    "support": {
+        "docs": "https://www.chilkatsoft.com/refdoc/",
+        "email": "support@chilkatsoft.com",
+        "forum": "https://www.chilkatforum.com/",
+        "issues": "https://www.chilkatforum.com/"
+    },
+    "authors": [
+        { "name": "Chilkat Software, Inc.", "homepage": "https://www.chilkatsoft.com/" }
+    ],
+    "require": {
+        "php": ">=8.1"
+    },
+    "suggest": {
+        "ext-chilkat2": "The extension that defines the Chilkat2\\ classes; installed by vendor/bin/chilkat2-install (see README).",
+        "ext-curl": "Lets chilkat2-install download the extension with the curl extension instead of stream wrappers.",
+        "ext-zlib": "Lets chilkat2-install extract the .tar.gz packages without a tar command."
+    },
+    "bin": ["bin/chilkat2-install"]
+}

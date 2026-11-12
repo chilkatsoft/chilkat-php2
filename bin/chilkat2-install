@@ -1,0 +1,627 @@
+#!/usr/bin/env php
+<?php
+/*
+ * chilkat2-install -- installs the Chilkat2 PHP extension (chilkat2.so / php_chilkat2.dll) that matches the
+ * PHP running this script, for the Chilkat version of the chilkat/chilkat2 Composer package.
+ *
+ *     vendor/bin/chilkat2-install             install for the PHP found first on the PATH
+ *     /usr/bin/php8.4 vendor/bin/chilkat2-install  install for a specific PHP (the one running the script is the target)
+ *     vendor/bin/chilkat2-install --dry-run   show what would be done, change nothing
+ *     vendor/bin/chilkat2-install --uninstall remove the extension and its ini entry again
+ *
+ * Chilkat2 PHP (namespace Chilkat2\) is a separate extension from the classic Chilkat PHP extension (chilkat/chilkat,
+ * extension=chilkat, CkHttp ...): this script never touches the classic one, and the two can be installed together.
+ * PHP 8.1 or later.
+ *
+ * Steps: 1. ask this PHP what it is (version, 32/64-bit, ZTS, CPU, glibc/musl, extension_dir, ini files);
+ *        2. pick the matching package from https://chilkatdownload.com/php/chilkat2-manifest-<version>.json;
+ *        3. download it, check the sha256, extract it;
+ *        4. copy chilkat2.so / php_chilkat2.dll into extension_dir (or --dir);
+ *        5. enable it: phpenmod (Debian/Ubuntu), a chilkat2.ini in the conf.d scan dir (Alpine, RHEL, Homebrew,
+ *           the official Docker images), or an extension= line in php.ini (created next to php.exe on Windows
+ *           when there is none);
+ *        6. verify by starting a fresh PHP and asking it whether the extension loaded.
+ *
+ * Options:
+ *   --dry-run        detect, choose and report; change nothing
+ *   --no-ini         don't touch any ini file; print the line to add instead
+ *   --dir=DIR        put the extension in DIR instead of extension_dir (the ini line then uses the absolute path)
+ *   --version=X.Y.Z  Chilkat version to install (default: the package's ChilkatVersion::VERSION)
+ *   --base-url=URL   where the manifests live (default https://chilkatdownload.com/php, or $CHILKAT_PHP_BASE)
+ *   --keep           keep the downloaded package (prints where)
+ *   --uninstall      remove the extension and the ini entry written by this script
+ *   -h, --help
+ *
+ * Exit codes: 0 ok, 1 error, 2 insufficient permissions (the message shows the sudo/Administrator command to run).
+ *
+ * Copyright (c) Chilkat Software, Inc.  Use freely.
+ */
+
+if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
+    fwrite(STDERR, "chilkat2-install must be run from the command line.\n");
+    exit(1);
+}
+
+// ----------------------------------------------------------------------------------------------- options
+$opt = array('dry-run' => false, 'no-ini' => false, 'dir' => '', 'version' => '', 'base-url' => '', 'keep' => false, 'uninstall' => false);
+$argv0 = array_shift($argv);
+foreach ($argv as $a) {
+    if ($a === '-h' || $a === '--help') {
+        $src = file_get_contents(__FILE__);
+        if (preg_match('~/\*(.*?)\*/~s', $src, $m)) echo preg_replace('/^ \* ?/m', '', trim($m[1])), "\n";
+        exit(0);
+    }
+    if (preg_match('/^--(dry-run|no-ini|keep|uninstall)$/', $a, $m)) { $opt[$m[1]] = true; continue; }
+    if (preg_match('/^--(dir|version|base-url)=(.+)$/', $a, $m)) { $opt[$m[1]] = $m[2]; continue; }
+    fail("unknown option: $a (try --help)");
+}
+if ($opt['version'] !== '' && !preg_match('/^\d+\.\d+\.\d+(\.\d+)?$/', $opt['version'])) fail("--version must look like 11.7.0");
+
+function say($s)  { echo $s, "\n"; }
+function info($s) { echo "  ", $s, "\n"; }
+function warn($s) { fwrite(STDERR, "warning: $s\n"); }
+function fail($s, $code = 1) { fwrite(STDERR, "error: $s\n"); exit($code); }
+
+// An ini line that enables THIS extension -- extension=chilkat2, chilkat2.so, php_chilkat2.dll, or a path to one
+// of them -- and never the classic extension (extension=chilkat, chilkat.so, php_chilkat.dll), which may be
+// installed alongside and is left alone.
+const CHILKAT2_INI_RE      = '/^[ \t]*extension[ \t]*=[ \t]*"?(?:[^\r\n";]*[\\\\\/])?(?:php_)?chilkat2(?:\.so|\.dll)?"?[ \t]*(?:;[^\r\n]*)?\r?$/m';
+const CHILKAT2_INI_RE_LINE = '/^[ \t]*extension[ \t]*=[ \t]*"?(?:[^\r\n";]*[\\\\\/])?(?:php_)?chilkat2(?:\.so|\.dll)?"?[ \t]*(?:;[^\r\n]*)?(?:\r?\n|\r?$)/m';
+
+// ----------------------------------------------------------------------------------------------- version
+$version = $opt['version'];
+if ($version === '') {
+    $vf = dirname(__DIR__) . '/src/ChilkatVersion.php';
+    if (is_file($vf)) {
+        require_once $vf;
+        if (class_exists('Chilkat2\\Composer\\ChilkatVersion', false)) $version = \Chilkat2\Composer\ChilkatVersion::VERSION;
+    }
+    if ($version === '') fail("cannot determine the Chilkat version (src/ChilkatVersion.php missing); use --version=X.Y.Z");
+}
+$baseUrl = $opt['base-url'] !== '' ? $opt['base-url'] : (getenv('CHILKAT_PHP_BASE') ?: 'https://chilkatdownload.com/php');
+$baseUrl = rtrim($baseUrl, '/');
+$dlRoot  = getenv('CHILKAT_DL_ROOT') ?: 'https://chilkatdownload.com';
+
+if (PHP_VERSION_ID < 80100) fail("Chilkat2 PHP needs PHP 8.1 or later; this is PHP " . PHP_VERSION . " (" . PHP_BINARY . ").  For older PHP use the classic extension: composer require chilkat/chilkat");
+
+// ----------------------------------------------------------------------------------------------- 1. what is this PHP?
+$isWin   = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
+$phpVer  = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+$zts     = (defined('PHP_ZTS') && PHP_ZTS) ? 'zts' : 'nts';
+$machine = php_uname('m');
+$extDir  = (string)ini_get('extension_dir');
+$iniFile = (string)php_ini_loaded_file();
+$scanDir = '';
+$scan = getenv('PHP_INI_SCAN_DIR');
+if ($scan === false || $scan === '') $scan = defined('PHP_CONFIG_FILE_SCAN_DIR') ? PHP_CONFIG_FILE_SCAN_DIR : '';
+if ($scan !== '') { $parts = explode(PATH_SEPARATOR, $scan); $scanDir = trim($parts[0]); }
+
+if ($isWin) {
+    $os = 'windows';
+} elseif (PHP_OS === 'Darwin') {
+    $os = 'macosx';
+} elseif (PHP_OS === 'Linux') {
+    $os = 'linux';
+    if (is_file('/etc/alpine-release') || glob('/lib/ld-musl-*')) {
+        $os = 'alpine';
+    } elseif (is_file('/etc/os-release')) {
+        $rel = file_get_contents('/etc/os-release');
+        if (preg_match('/^ID="?(centos|rhel|ol)"?/m', $rel) && preg_match('/^VERSION_ID="?7/m', $rel)) $os = 'centos7';
+    }
+} else {
+    fail("unsupported OS '" . PHP_OS . "' (Linux, Alpine Linux, macOS and Windows are supported)");
+}
+
+if ($isWin) {
+    $arch = PHP_INT_SIZE === 8 ? 'x86_64' : 'x86';
+} else {
+    switch (true) {
+        case preg_match('/^(x86_64|amd64)$/', $machine):     $arch = 'x86_64'; break;
+        case preg_match('/^(i[3-6]86|x86)$/', $machine):     $arch = 'x86'; break;
+        case preg_match('/^(aarch64|arm64)$/', $machine):    $arch = 'arm64'; break;
+        case preg_match('/^(armv[67]|armhf|arm)/', $machine): $arch = 'armv7l'; break;
+        default: fail("unrecognized CPU '$machine'");
+    }
+    if (PHP_INT_SIZE === 4) {                                  // 32-bit PHP on a 64-bit kernel
+        if ($arch === 'x86_64') $arch = 'x86';
+        if ($arch === 'arm64') $arch = 'armv7l';
+    }
+}
+
+$already = extension_loaded('chilkat2') ? phpversion('chilkat2') : '';
+
+say("Chilkat2 PHP extension installer (chilkat/chilkat2 " . $version . ")");
+info("PHP:            " . PHP_VERSION . " (" . PHP_BINARY . ")");
+info("Build needed:   PHP $phpVer, $os, $arch, $zts");
+info("extension_dir:  " . ($extDir !== '' ? $extDir : '(not set)'));
+info("php.ini:        " . ($iniFile !== '' ? $iniFile : '(none loaded)'));
+if (!$isWin) info("conf.d scan:    " . ($scanDir !== '' ? $scanDir : '(none)'));
+if ($already !== '') info("Chilkat2:       " . ($opt['uninstall'] ? "currently loaded (v$already)" : "already loaded (v$already) -- will be replaced"));
+
+// ----------------------------------------------------------------------------------------------- where things go
+$soName = $isWin ? 'php_chilkat2.dll' : 'chilkat2.so';
+if ($opt['dir'] !== '') {
+    $installDir = $opt['dir'];
+    if (!isAbsolute($installDir)) $installDir = getcwd() . DIRECTORY_SEPARATOR . $installDir;
+    $iniLine = 'extension=' . ($isWin ? '"' . $installDir . '\\' . $soName . '"' : $installDir . '/' . $soName);
+} else {
+    if ($isWin) {
+        if ($extDir === '') $extDir = 'ext';
+        if (!isAbsolute($extDir)) $extDir = dirname(PHP_BINARY) . '\\' . $extDir;   // PHP resolves a relative extension_dir against php.exe
+    } elseif ($extDir === '') {
+        fail("PHP reports no extension_dir; use --dir=DIR");
+    }
+    $installDir = $extDir;
+    $iniLine = 'extension=chilkat2';        // PHP maps the name to chilkat2.so / php_chilkat2.dll in extension_dir
+}
+$installPath = $installDir . DIRECTORY_SEPARATOR . $soName;
+
+// Debian/Ubuntu: /etc/php/<ver>/mods-available + phpenmod enables it for every SAPI (cli, fpm, apache2).
+$modsDir = '';
+if (!$isWin && is_dir("/etc/php/$phpVer/mods-available") && commandExists('phpenmod')) $modsDir = "/etc/php/$phpVer/mods-available";
+
+// ----------------------------------------------------------------------------------------------- uninstall
+if ($opt['uninstall']) {
+    say("Uninstalling...");
+    if ($opt['dry-run']) { info("(dry run) would remove $installPath and the ini entry"); exit(0); }
+    $check = array();
+    if (is_file($installPath)) $check[] = dirname($installPath);
+    if ($modsDir !== '' && is_file("$modsDir/chilkat2.ini")) $check[] = $modsDir;
+    if ($scanDir !== '' && is_file("$scanDir/chilkat2.ini")) $check[] = $scanDir;
+    needWritable($check, $iniFile);
+    if ($modsDir !== '' && is_file("$modsDir/chilkat2.ini")) {
+        run("phpdismod -v " . escapeshellarg($phpVer) . " chilkat2");
+        unlink("$modsDir/chilkat2.ini"); info("removed $modsDir/chilkat2.ini");
+    }
+    if ($scanDir !== '' && is_file("$scanDir/chilkat2.ini")) { unlink("$scanDir/chilkat2.ini"); info("removed $scanDir/chilkat2.ini"); }
+    if ($iniFile !== '' && is_file($iniFile)) {
+        $txt = file_get_contents($iniFile);
+        if (strpos($txt, '; php.ini created by the Chilkat2 installer') === 0) {
+            unlink($iniFile); info("removed $iniFile (it was created by this installer)");
+        } else {
+            $nl = newlineOf($txt);
+            $new = preg_replace('/(\r?\n)*^; Chilkat2 PHP extension[^\r\n]*\r?\n/m', $nl, $txt);
+            $new = preg_replace(CHILKAT2_INI_RE_LINE, '', $new);
+            if ($new !== $txt) { copy($iniFile, "$iniFile.bak"); file_put_contents($iniFile, $new); info("removed the extension line from $iniFile (backup: $iniFile.bak)"); }
+        }
+    }
+    if (is_file($installPath)) { if (removeFile($installPath)) info("removed $installPath"); }
+    say("Done.");
+    exit(0);
+}
+
+// ----------------------------------------------------------------------------------------------- 2. choose the package
+$file = ''; $url = ''; $sha = ''; $size = 0;
+$manifest = fetchManifest("$baseUrl/chilkat2-manifest-$version.json");
+if ($manifest === null) {
+    $latest = fetchManifest("$baseUrl/chilkat2-manifest.json");
+    if ($latest !== null && isset($latest['version']) && $latest['version'] === $version) $manifest = $latest;
+}
+if ($manifest !== null) {
+    $avail = array();
+    foreach ($manifest['builds'] as $b) {
+        if ($b['os'] !== $os || $b['arch'] !== $arch) continue;
+        $avail[] = $b['php'] . ($b['zts'] ? ' (zts)' : ' (nts)');
+        if ($b['php'] === $phpVer && (bool)$b['zts'] === ($zts === 'zts')) {
+            $file = $b['file']; $url = $b['url']; $sha = isset($b['sha256']) ? $b['sha256'] : ''; $size = isset($b['size']) ? (int)$b['size'] : 0;
+        }
+    }
+    if ($file === '') {
+        $avail = array_unique($avail); natsort($avail);
+        fail("no Chilkat2 $version build for PHP $phpVer $zts on $os/$arch" . ($avail ? "; builds available for $os/$arch: " . implode(', ', $avail) : "; no builds at all for $os/$arch"));
+    }
+} else {
+    // No manifest for this version: build the file name the way the packages are named.
+    warn("no manifest for Chilkat $version at $baseUrl; downloading by name without a checksum");
+    if ($os === 'windows') {
+        $file = 'chilkat2-php-' . $phpVer . ($zts === 'zts' ? '-' : '-nts-') . ($arch === 'x86_64' ? 'x64' : 'win32') . '.zip';
+    } else {
+        $distArch = ($arch === 'arm64' && $os !== 'macosx') ? 'aarch64' : $arch;
+        $file = 'chilkat2-php-' . ($zts === 'zts' ? 'zts-' : '') . "$phpVer-$distArch-$os.tar.gz";
+    }
+    $url = "$dlRoot/$version/$file";
+}
+
+info("Package:        $file (Chilkat v$version)");
+info("Install to:     $installPath");
+if ($opt['no-ini'])        info("ini:            (untouched, --no-ini)");
+elseif ($modsDir !== '')  info("ini:            $modsDir/chilkat2.ini + phpenmod");
+elseif (!$isWin && $scanDir !== '' && is_dir($scanDir)) info("ini:            $scanDir/chilkat2.ini");
+elseif ($iniFile !== '')   info("ini:            append to $iniFile");
+elseif ($isWin)            info("ini:            no php.ini loaded -- will create " . dirname(PHP_BINARY) . "\\php.ini");
+else                       info("ini:            no php.ini found -- will print the line to add");
+
+// Alpine: chilkat2.so needs libstdc++, which the minimal images (php:*-alpine and friends) do not ship.
+$needLibstdcxx = ($os === 'alpine' && !is_file('/usr/lib/libstdc++.so.6') && !is_file('/lib/libstdc++.so.6'));
+if ($opt['dry-run']) {
+    if ($needLibstdcxx) info("libstdc++:      missing -- would run 'apk add libstdc++' first (chilkat2.so needs it)");
+    say("Dry run: nothing downloaded or changed.  Package URL: $url");
+    exit(0);
+}
+if ($needLibstdcxx) {
+    if (commandExists('apk') && function_exists('posix_getuid') ? posix_getuid() === 0 : is_writable('/lib/apk/db')) {
+        say("Installing libstdc++ (apk) -- chilkat2.so needs it and this Alpine has none ...");
+        $out = array(); $rc = 1;
+        exec('apk add --no-cache libstdc++ 2>&1', $out, $rc);
+        if ($rc !== 0) fail("apk add libstdc++ failed:\n" . implode("\n", $out));
+    } else {
+        fail("libstdc++.so.6 is missing and chilkat2.so needs it: run 'apk add libstdc++' (as root) first");
+    }
+}
+
+// permissions, before the download (only the one ini location that will actually be written)
+$check = array($installDir); $checkIni = '';
+if (!$opt['no-ini']) {
+    if ($modsDir !== '') $check[] = $modsDir;
+    elseif (!$isWin && $scanDir !== '' && is_dir($scanDir)) $check[] = $scanDir;
+    elseif ($iniFile !== '') $checkIni = $iniFile;
+    elseif ($isWin) $check[] = dirname(PHP_BINARY);
+}
+needWritable($check, $checkIni);
+
+// ----------------------------------------------------------------------------------------------- 3. download, verify, extract
+$tmp = rtrim(sys_get_temp_dir(), '/\\') . DIRECTORY_SEPARATOR . 'chilkat2-php-install.' . getmypid();
+if (!is_dir($tmp) && !mkdir($tmp, 0700, true)) fail("cannot create $tmp");
+register_shutdown_function(function () use ($tmp, $opt) { if (!$opt['keep']) rmTree($tmp); });
+
+$pkg = $tmp . DIRECTORY_SEPARATOR . $file;
+say("Downloading $url ...");
+if (!download($url, $pkg)) fail("download failed: $url");
+if (!is_file($pkg) || filesize($pkg) === 0) fail("downloaded file is empty: $url");
+if ($size > 0 && filesize($pkg) !== $size) fail("size mismatch for $file (expected $size bytes, got " . filesize($pkg) . ")");
+if ($sha !== '') {
+    $got = hash_file('sha256', $pkg);
+    if (strtolower($got) !== strtolower($sha)) fail("sha256 mismatch for $file (expected $sha, got $got)");
+    info("sha256 verified");
+}
+
+$x = $tmp . DIRECTORY_SEPARATOR . 'x';
+mkdir($x, 0700, true);
+extractPackage($pkg, $x, $soName);
+$soSrc = findFile($x, $soName);
+if ($soSrc === null) fail("$soName not found inside $file");
+$pkgDir = dirname($soSrc);
+
+// ----------------------------------------------------------------------------------------------- 4. install
+if (!is_dir($installDir) && !mkdir($installDir, 0755, true)) fail("cannot create $installDir");
+if (!replaceFile($soSrc, $installPath)) fail("cannot copy $soName to $installDir");
+info("installed $installPath");
+
+// ----------------------------------------------------------------------------------------------- 5. enable
+$iniDone = '';
+if (!$opt['no-ini']) {
+    $body = "; Chilkat2 PHP extension (installed by chilkat2-install, Chilkat v$version)\n$iniLine\n";
+    // Already enabled by an ini file this script did not write (a hand edit, or a distro package)?  Then adding a
+    // second extension= line would make PHP warn "Module chilkat2 is already loaded" on every start.
+    $ours = array();
+    if ($modsDir !== '') $ours[] = realpath("$modsDir/chilkat2.ini") ?: "$modsDir/chilkat2.ini";
+    if ($scanDir !== '') $ours[] = realpath("$scanDir/chilkat2.ini") ?: "$scanDir/chilkat2.ini";
+    $foreign = array();
+    foreach (findEnablingIniFiles() as $f) {
+        $rf = realpath($f) ?: $f;
+        if (!in_array($rf, $ours, true) && strpos(file_get_contents($f), '; Chilkat2 PHP extension (installed by') === false) $foreign[] = $f;
+    }
+    if ($foreign) {
+        $iniDone = implode(', ', $foreign) . " (already enabled there; nothing added)";
+        // an ini of ours from an earlier run would be a second enable line: drop it
+        if ($modsDir !== '' && is_file("$modsDir/chilkat2.ini")) { run("phpdismod -v " . escapeshellarg($phpVer) . " chilkat2"); @unlink("$modsDir/chilkat2.ini"); info("removed the duplicate $modsDir/chilkat2.ini"); }
+        if ($scanDir !== '' && is_file("$scanDir/chilkat2.ini")) { @unlink("$scanDir/chilkat2.ini"); info("removed the duplicate $scanDir/chilkat2.ini"); }
+    } elseif ($modsDir !== '') {
+        file_put_contents("$modsDir/chilkat2.ini", $body);
+        run("phpenmod -v " . escapeshellarg($phpVer) . " chilkat2");
+        $iniDone = "$modsDir/chilkat2.ini (enabled for all SAPIs with phpenmod)";
+    } elseif (!$isWin && $scanDir !== '' && is_dir($scanDir)) {
+        file_put_contents("$scanDir/chilkat2.ini", $body);
+        $iniDone = "$scanDir/chilkat2.ini";
+    } elseif ($iniFile !== '') {
+        $txt = file_get_contents($iniFile);
+        if (preg_match(CHILKAT2_INI_RE, $txt)) {
+            $iniDone = "$iniFile (already had an extension=chilkat2 line)";
+        } else {
+            $nl = newlineOf($txt);
+            copy($iniFile, "$iniFile.bak");
+            $sep = ($txt !== '' && substr($txt, -1) !== "\n") ? $nl : '';
+            file_put_contents($iniFile, $txt . $sep . $nl . str_replace("\n", $nl, $body));
+            $iniDone = "$iniFile (backup: $iniFile.bak)";
+        }
+    } elseif ($isWin) {
+        // No php.ini loaded (normal for a fresh zip install): create a minimal one next to php.exe.
+        $newIni = dirname(PHP_BINARY) . '\\php.ini';
+        if (is_file($newIni)) {
+            warn("$newIni exists but PHP is not loading it -- check 'php --ini'");
+        } else {
+            file_put_contents($newIni, "; php.ini created by the Chilkat2 installer -- PHP defaults apply for everything not listed here\r\nextension_dir=\"$installDir\"\r\n" . str_replace("\n", "\r\n", $body));
+            $iniDone = "$newIni (created)";
+        }
+    }
+    if ($iniDone !== '') info("enabled via $iniDone");
+    else warn("no ini file was written.  Add this line to php.ini (or a conf.d/chilkat2.ini):  $iniLine");
+}
+
+// ----------------------------------------------------------------------------------------------- 6. verify in a fresh PHP
+say("Verifying...");
+// A fresh PHP process (this one has the old extension loaded).  The check is a file, not -r code: on Windows
+// escapeshellarg() turns embedded double quotes into spaces, which would break any inline PHP.
+$extra = ($opt['no-ini'] || $iniDone === '') ? array('-d', "extension=$installPath") : array();
+// The same php.ini as this PHP (it may have been started with -c); the conf.d scan dir is inherited from the environment.
+if ($iniFile !== '' && is_file($iniFile)) $extra = array_merge(array('-c', $iniFile), $extra);
+$verifyPhp = $tmp . DIRECTORY_SEPARATOR . 'verify.php';
+file_put_contents($verifyPhp, "<?php echo extension_loaded('chilkat2') ? phpversion('chilkat2') : '';\n");
+list($ckv, $rc) = runPhp(array_merge($extra, array($verifyPhp)), $tmp);
+$ckvRaw = trim($ckv);
+// The version is the last line: anything before it is a startup message about some other extension (which must
+// not hide that chilkat2 itself loaded fine).
+$ckvLines = preg_split('/\r?\n/', $ckvRaw);
+$ckv = preg_match('/^(\d+\.\d+\.\d+)/', trim((string)end($ckvLines)), $mm) ? $mm[1] : '';
+if ($ckv !== '' && count($ckvLines) > 1) warn("PHP printed this at startup -- the extension loads, but these messages are worth fixing:\n" . implode("\n", array_slice($ckvLines, 0, -1)));
+if ($ckv === '') {
+    fail("PHP did not load the extension" . ($ckvRaw !== '' ? ":\n$ckvRaw" : '') . "\nTry:  " . PHP_BINARY . " -d extension=$installPath -m");
+}
+info("PHP loads the chilkat2 extension v$ckv");
+if (stripos($ckvRaw, 'already loaded') !== false) {
+    warn("PHP reports the chilkat2 extension is enabled more than once -- remove the duplicate extension= line from one of: " . implode(', ', findEnablingIniFiles()));
+}
+if (is_file("$pkgDir/test.php")) {
+    list($out, $rc) = runPhp(array_merge($extra, array('test.php')), $pkgDir);
+    foreach (explode("\n", rtrim($out)) as $line) echo "    ", $line, "\n";
+    if ($rc !== 0) { fwrite(STDERR, rtrim($out) . "\n"); warn("test.php exited with status $rc -- the extension loads, but something is wrong (see output above)"); }
+}
+
+say("");
+say("Chilkat2 v$version for PHP $phpVer is installed.");
+say("The classes come from the extension -- nothing to include: e.g. \$http = new Chilkat2\\Http();");
+say("For your IDE / PHPStan / Psalm: " . dirname(__DIR__) . DIRECTORY_SEPARATOR . 'stubs' . DIRECTORY_SEPARATOR . "chilkat2.stub.php");
+if ($opt['no-ini'] || $iniDone === '') say("To enable it, add this line to php.ini (or a conf.d/chilkat2.ini):   $iniLine");
+say("If PHP runs under a web server or PHP-FPM, restart it so it picks up the extension.");
+if ($opt['keep']) say("Downloaded package kept in $tmp");
+exit(0);
+
+// =============================================================================================== helpers
+// Installs $src as $dst without ever writing into a file that a running PHP may have mapped: the running
+// installer itself usually has the old chilkat2.so/.dll loaded, and on Linux overwriting a mapped shared object
+// in place corrupts that process (it crashes at shutdown), while on Windows the loaded file is simply locked.
+// So the new file is written next to the old one and renamed over it (atomic on POSIX, the old inode lives on
+// until every process using it exits).  Windows cannot rename over a loaded DLL, but it can rename the loaded
+// DLL away, so it is moved aside as php_chilkat2.dll.old.* first; the .old files are deleted on the next run.
+function replaceFile($src, $dst) {
+    foreach (glob($dst . '.old.*') ?: array() as $stale) @unlink($stale);
+    $tmp = $dst . '.new.' . getmypid();
+    if (!@copy($src, $tmp)) return false;
+    @chmod($tmp, 0644);
+    if (@rename($tmp, $dst)) return true;
+    if (is_file($dst)) {
+        $aside = $dst . '.old.' . getmypid();
+        if (@rename($dst, $aside)) {
+            if (@rename($tmp, $dst)) { info("(the previous $dst was in use and was moved aside as " . basename($aside) . ")"); return true; }
+            @rename($aside, $dst);
+        }
+    }
+    @unlink($tmp);
+    return false;
+}
+
+// Deletes a file, or on Windows renames it aside when it is in use (loaded by this or another PHP).
+function removeFile($path) {
+    foreach (glob($path . '.old.*') ?: array() as $stale) @unlink($stale);
+    if (@unlink($path)) return true;
+    if (DIRECTORY_SEPARATOR === '\\' && @rename($path, $path . '.old.' . getmypid())) {
+        info("$path is in use; it was renamed to " . basename($path . '.old.' . getmypid()) . " and will be deleted on the next run");
+        return true;
+    }
+    warn("could not remove $path");
+    return false;
+}
+
+// Runs PHP_BINARY with the given arguments in $cwd; returns array(combined output, exit code).
+function runPhp(array $args, $cwd) {
+    $cmd = escapeshellarg(PHP_BINARY);
+    foreach ($args as $a) $cmd .= ' ' . escapeshellarg($a);
+    $spec = array(0 => array('pipe', 'r'), 1 => array('pipe', 'w'), 2 => array('pipe', 'w'));
+    $p = proc_open($cmd, $spec, $pipes, $cwd);
+    if (!is_resource($p)) return array('(could not start ' . PHP_BINARY . ')', -1);
+    fclose($pipes[0]);
+    $out = stream_get_contents($pipes[1]); fclose($pipes[1]);
+    $err = stream_get_contents($pipes[2]); fclose($pipes[2]);
+    $rc = proc_close($p);
+    return array($out . $err, $rc);
+}
+
+// Every ini file PHP read at startup (php.ini + the scanned conf.d files) that enables the chilkat2 extension.
+function findEnablingIniFiles() {
+    $files = array();
+    $main = php_ini_loaded_file();
+    if ($main) $files[] = $main;
+    $scanned = php_ini_scanned_files();
+    if ($scanned) foreach (explode(',', $scanned) as $f) { $f = trim($f); if ($f !== '') $files[] = $f; }
+    $hits = array();
+    foreach ($files as $f) {
+        if (!is_file($f)) continue;
+        if (preg_match(CHILKAT2_INI_RE, file_get_contents($f))) $hits[] = $f;
+    }
+    return $hits;
+}
+
+function isAbsolute($p) { return preg_match('~^([a-zA-Z]:[\\\\/]|\\\\\\\\|/)~', $p) === 1; }
+
+function commandExists($cmd) {
+    $which = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN' ? 'where' : 'command -v';
+    return trim((string)shell_exec("$which " . escapeshellarg($cmd) . " 2>" . (DIRECTORY_SEPARATOR === '\\' ? 'NUL' : '/dev/null'))) !== '';
+}
+
+function run($cmd) {
+    $out = shell_exec($cmd . ' 2>&1');
+    if ($out !== null && trim($out) !== '') info(trim($out));
+}
+
+// The line-ending style a file already uses (CRLF for Windows-made files), so an edit doesn't mix styles.
+function newlineOf($txt) {
+    $lf = substr_count($txt, "\n"); $crlf = substr_count($txt, "\r\n");
+    if ($lf === 0) return DIRECTORY_SEPARATOR === '\\' ? "\r\n" : "\n";
+    return ($crlf * 2 >= $lf) ? "\r\n" : "\n";
+}
+
+// Exits with code 2 and the command to re-run when any of the directories (or the ini file) is not writable.
+function needWritable(array $dirs, $iniFile) {
+    $bad = array();
+    foreach ($dirs as $d) {
+        if ($d === '') continue;
+        $probe = $d;
+        while (!file_exists($probe) && dirname($probe) !== $probe) $probe = dirname($probe);   // nearest existing ancestor
+        if (!is_writable($probe)) $bad[] = $d;
+    }
+    if ($iniFile !== '' && is_file($iniFile) && !is_writable($iniFile)) $bad[] = $iniFile;
+    if (!$bad) return;
+    $bad = array_unique($bad);
+    fwrite(STDERR, "error: not writable: " . implode(', ', $bad) . "\n");
+    global $argv0;
+    $args = array_slice($GLOBALS['argv'], 0);
+    if (DIRECTORY_SEPARATOR === '\\') {
+        fwrite(STDERR, "Run this again from an Administrator PowerShell / Command Prompt, or use --dir=DIR to install somewhere writable.\n");
+    } else {
+        fwrite(STDERR, "Run it with sudo:\n    sudo " . PHP_BINARY . " " . escapeshellarg(realpath($argv0) ?: $argv0) . ($args ? ' ' . implode(' ', array_map('escapeshellarg', $args)) : '') . "\n"
+            . "or use --dir=DIR to install somewhere writable (the ini line then uses the absolute path).\n");
+    }
+    exit(2);
+}
+
+function fetchManifest($url) {
+    $err = '';
+    $json = fetchUrl($url, null, $err);
+    if ($json === null) {
+        if ($err !== '404') warn("could not fetch $url: $err");     // a 404 is normal for an old version's manifest
+        return null;
+    }
+    $m = json_decode($json, true);
+    if (!is_array($m) || empty($m['builds'])) { warn("$url is not a valid manifest"); return null; }
+    return $m;
+}
+
+function httpGet($url) { $err = ''; return fetchUrl($url, null, $err); }
+
+function download($url, $dest) {
+    $err = '';
+    if (fetchUrl($url, $dest, $err) !== null) return true;
+    warn($err);
+    return false;
+}
+
+// Fetches a URL into a string ($toFile === null) or a file.  Returns the string / the file path, or null.
+// $err receives '404' for a missing URL, otherwise a description of the last failure.
+// Tries, in order: the curl extension (told to use the Windows certificate store when libcurl can, since a
+// PHP zip install has no CA bundle); the curl command (Windows 10+ ships one that uses the system store);
+// PHP's https stream wrapper; wget.
+function fetchUrl($url, $toFile, &$err) {
+    $err = '';
+    $tried = array();
+    $isWin = DIRECTORY_SEPARATOR === '\\';
+
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        $opts = array(CURLOPT_FOLLOWLOCATION => true, CURLOPT_CONNECTTIMEOUT => 20, CURLOPT_TIMEOUT => 600, CURLOPT_USERAGENT => 'chilkat2-install');
+        if (defined('CURLSSLOPT_NATIVE_CA')) $opts[CURLOPT_SSL_OPTIONS] = CURLSSLOPT_NATIVE_CA;
+        $fp = null;
+        if ($toFile === null) $opts[CURLOPT_RETURNTRANSFER] = true;
+        else { $fp = fopen($toFile, 'wb'); if (!$fp) { $err = "cannot write $toFile"; return null; } $opts[CURLOPT_FILE] = $fp; }
+        curl_setopt_array($ch, $opts);
+        $body = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $cerr = curl_error($ch);
+        if (PHP_VERSION_ID < 80000) curl_close($ch);
+        if ($fp) fclose($fp);
+        if ($body !== false && $code >= 200 && $code < 300) return $toFile === null ? $body : $toFile;
+        if ($fp) @unlink($toFile);
+        if ($code === 404) { $err = '404'; return null; }
+        $tried[] = 'curl extension: ' . ($cerr !== '' ? $cerr : "HTTP $code");
+        warn(end($tried) . " -- trying another way to download");
+    }
+
+    if (commandExists('curl')) {
+        $cmd = 'curl -fsSL --connect-timeout 20 ' . ($toFile !== null ? '-o ' . escapeshellarg($toFile) . ' ' : '') . escapeshellarg($url) . ' 2>&1';
+        $out = array(); $rc = 1;
+        exec($cmd, $out, $rc);
+        if ($rc === 0) {
+            if ($toFile !== null) return $toFile;
+            // exec() split the body into lines; re-fetch as one string
+            $body = shell_exec('curl -fsSL --connect-timeout 20 ' . escapeshellarg($url));
+            if ($body !== null && $body !== '') return $body;
+        }
+        if ($rc === 22 && strpos(implode(' ', $out), '404') !== false) { $err = '404'; return null; }
+        $tried[] = 'curl command: exit ' . $rc . ' ' . trim(implode(' ', $out));
+        warn(end($tried) . " -- trying another way to download");
+        if ($toFile !== null) @unlink($toFile);
+    }
+
+    if (ini_get('allow_url_fopen')) {
+        // PHP 8.4+ exposes the response headers through http_get_last_response_headers(); on older PHP the
+        // legacy "http_response_header" variable would be used, but merely spelling that name in this file makes PHP 8.5
+        // emit a deprecation at compile time, so older PHP just goes by whether the body arrived (ignore_errors off).
+        $modern = function_exists('http_get_last_response_headers');
+        $ctx = stream_context_create(array('http' => array('timeout' => 600, 'follow_location' => 1, 'user_agent' => 'chilkat2-install', 'ignore_errors' => $modern)));
+        $body = @file_get_contents($url, false, $ctx);
+        $status = 0;
+        if ($modern) {
+            $hdrs = http_get_last_response_headers();
+            if (is_array($hdrs) && isset($hdrs[0]) && preg_match('~ (\d{3}) ~', $hdrs[0], $mm)) $status = (int)$mm[1];
+        } elseif ($body !== false) {
+            $status = 200;
+        }
+        if ($body !== false && $status >= 200 && $status < 300) {
+            if ($toFile === null) return $body;
+            if (file_put_contents($toFile, $body) !== false) return $toFile;
+        }
+        if ($status === 404) { $err = '404'; return null; }
+        $e = error_get_last();
+        $tried[] = 'https stream: ' . ($status ? "HTTP $status" : (($e && isset($e['message'])) ? $e['message'] : 'failed'));
+        warn(end($tried) . " -- trying another way to download");
+    }
+
+    if (!$isWin && commandExists('wget')) {
+        $out = array(); $rc = 1;
+        exec('wget -q ' . ($toFile !== null ? '-O ' . escapeshellarg($toFile) : '-O -') . ' ' . escapeshellarg($url) . ' 2>&1', $out, $rc);
+        if ($rc === 0) return $toFile !== null ? $toFile : implode("\n", $out);
+        if ($rc === 8) { $err = '404'; return null; }
+        $tried[] = 'wget: exit ' . $rc;
+    }
+
+    $err = $tried ? implode('; ', $tried) : 'no way to download (no curl extension or command, allow_url_fopen is off, no wget)';
+    return null;
+}
+
+function extractPackage($pkg, $dir, $soName) {
+    $isZip = substr($pkg, -4) === '.zip';
+    if (!$isZip && commandExists('tar')) {           // the tar command keeps modes and is always there on Unix
+        shell_exec('tar -xzf ' . escapeshellarg($pkg) . ' -C ' . escapeshellarg($dir) . ' 2>&1');
+        if (findFile($dir, $soName) !== null) return;
+    }
+    if ($isZip && class_exists('ZipArchive')) {
+        $z = new ZipArchive();
+        if ($z->open($pkg) === true) { $z->extractTo($dir); $z->close(); return; }
+    }
+    if (class_exists('PharData')) {
+        try {
+            $p = new PharData($pkg);
+            $p->extractTo($dir, null, true);
+            return;
+        } catch (Exception $e) {
+            warn("PharData: " . $e->getMessage());
+        }
+    }
+    if ($isZip && commandExists('tar')) {              // Windows 10+ ships bsdtar, which reads zip files
+        shell_exec('tar -xf ' . escapeshellarg($pkg) . ' -C ' . escapeshellarg($dir) . ' 2>&1');
+        return;
+    }
+    fail("cannot extract $pkg (need the zip or phar extension, or a tar command)");
+}
+
+function findFile($dir, $name) {
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS));
+    foreach ($it as $f) if ($f->getFilename() === $name) return $f->getPathname();
+    return null;
+}
+
+function rmTree($dir) {
+    if (!is_dir($dir)) return;
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
+    foreach ($it as $f) $f->isDir() ? @rmdir($f->getPathname()) : @unlink($f->getPathname());
+    @rmdir($dir);
+}

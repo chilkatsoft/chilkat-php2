@@ -1,0 +1,6 @@
+# Everything text is stored and checked out with LF (the package is consumed mostly on Linux/macOS; git on
+# Windows with core.autocrlf=true would otherwise warn about every file).  Binary files are auto-detected.
+* text=auto eol=lf
+# keep the package small: consumers need bin/, stubs/, src/, composer.json, README and LICENSE
+/.gitattributes export-ignore
+/.gitignore     export-ignore
